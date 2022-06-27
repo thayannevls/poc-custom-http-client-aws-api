@@ -1,4 +1,4 @@
-(ns custom-client
+(ns java-http-client
   (:require [cognitect.aws.http :as aws-http]
             [clojure.core.async :refer (put!)]
             [cognitect.aws.client.api :as aws]
@@ -9,12 +9,14 @@
             HttpRequest$BodyPublishers
             HttpResponse$BodyHandlers
             HttpRequest$Builder
-            HttpClient$Version
             HttpClient]
-           (java.time Duration)
-           (java.util.concurrent CompletableFuture)
-           (java.util.function Function)))
+           (java.util.function Function)
+           (java.nio ByteBuffer)))
 
+;Macro from https://github.com/schmee/java-http-clj/blob/72550432db9f146621acabd647db262da865740e/src/java_http_clj/util.clj#L16
+(defmacro clj-fn->function ^Function [f]
+  `(reify Function
+     (~'apply [_# x#] (~f x#))))
 
 (def method-string
      {:get "GET"
@@ -23,11 +25,6 @@
       :head "HEAD"
       :delete "DELETE"
       :patch "PATCH"})
-
-;Macro from https://github.com/schmee/java-http-clj/blob/72550432db9f146621acabd647db262da865740e/src/java_http_clj/util.clj#L16
-(defmacro clj-fn->function ^Function [f]
-  `(reify Function
-     (~'apply [_# x#] (~f x#))))
 
 ; TODO: Allow InputStream and String types in body
 (defn body->publisher
@@ -57,31 +54,34 @@
               req
               ; TODO: Remove host from unrestricted headers list
               (dissoc headers "host"))]
-    (print (type (.build ^HttpRequest$Builder req)))
-    (.build ^HttpRequest$Builder req)))
+    (.build req)))
 
+(defn response->headers
+  [response]
+  (into {}
+        (map (fn [[k v]] [k (if (> (count v) 1) (vec v) (first v))]))
+        (.map (.headers response))))
 
 (defn submit
   [client
    request
    channel]
-  (let [java-request' (request-map->java-net-http-request request)
-        req' (.sendAsync client java-request' (HttpResponse$BodyHandlers/ofByteArray))]
-    (.thenApply req' (clj-fn->function
-                       (fn [result]
-                         (put! channel (.body result)))))
-    channel))
+  (let [java-request (request-map->java-net-http-request request)]
+    (let [req (.sendAsync client java-request (HttpResponse$BodyHandlers/ofByteArray))]
+      (.thenApply req (clj-fn->function
+                        (fn [response]
+                          (put! channel {:status (.statusCode response)
+                                         :headers (response->headers response)
+                                         :body   (ByteBuffer/wrap (.body response))})
+                          response)))
+      channel)))
 
 (defn stop [_] nil)
 
-(def java-http-client '(-> (HttpClient/newBuilder)
-                          (.version HttpClient$Version/HTTP_2)
-                          (.connectTimeout (Duration/ofSeconds 10))
-                          (.build)))
+(def java-http-client (HttpClient/newHttpClient))
 
 (def client (reify aws-http/HttpClient
               (-submit [_ request channel]
-                (println request)
                 (submit java-http-client request channel))
               (-stop [_] (stop java-http-client))))
 
@@ -91,3 +91,7 @@
 
 (aws/ops s3)
 (aws/invoke s3 {:op :ListBuckets})
+
+(comment
+  (def bucket-name "created-from-java-client")
+  (aws/invoke s3 {:op :CreateBucket :request {:Bucket bucket-name}}))
